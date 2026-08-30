@@ -1,6 +1,6 @@
 import { FormEvent, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-const API = `${import.meta.env.VITE_API_URL}/api/v1`;
+const API = `${(import.meta.env.VITE_API_URL || "").replace(/\/$/, "")}/api/v1`;
 const tabs = [
   "Dashboard",
   "Markets",
@@ -21,10 +21,13 @@ const symbols: Record<string, string> = {
   BANKNIFTY: "NSE:NIFTY BANK",
   FINNIFTY: "NSE:NIFTY FIN SERVICE",
 };
-async function api(path: string) {
-  const r = await fetch(API + path);
+async function api(path: string, init: RequestInit = {}) {
+  const token = localStorage.getItem("autobot_token");
+  const headers = new Headers(init.headers);
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  const r = await fetch(API + path, { ...init, headers });
   if (!r.ok) throw new Error(await r.text());
-  return r.json();
+  return r.status === 204 ? null : r.json();
 }
 function Table({ rows }: { rows: any[] }) {
   if (!rows?.length) return <p className="muted">No records yet.</p>;
@@ -126,7 +129,7 @@ export default function App() {
     setToken(d.access_token);
   }
   async function logout() {
-    await fetch(`${API}/broker/zerodha/logout`, { method: "POST" });
+    await api("/broker/zerodha/logout", { method: "POST" });
     localStorage.removeItem("autobot_token");
     setToken(null);
   }

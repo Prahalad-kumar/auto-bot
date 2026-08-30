@@ -4,19 +4,43 @@ from io import BytesIO
 from datetime import date
 import pandas as pd
 from fastapi import File, UploadFile
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import RedirectResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from app.db.session import get_db
 from app.models import User, Strategy, Signal, Order, Position, Trade, BrokerConnection
-from app.schemas.trading import LoginRequest, Token, StrategyCreate
+from app.schemas.trading import LoginRequest, Token, StrategyCreate, UserCreate, UserUpdate, UserOut
 from app.core.security import hash_password, verify_password, create_access_token
+from jose import JWTError, jwt
 from app.core.config import settings
 from app.services.backtest.engine import BacktestEngine
 from app.services.market_data.candles import Candle
 
 api=APIRouter()
+bearer_scheme = HTTPBearer(auto_error=False)
+
+def _current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
+) -> User:
+    if not credentials or credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
+    try:
+        payload = jwt.decode(credentials.credentials, settings.JWT_SECRET, algorithms=["HS256"])
+        email = payload.get("sub")
+        if not email:
+            raise ValueError
+    except (JWTError, ValueError):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
+    user = db.query(User).filter(func.lower(User.email) == str(email).strip().lower()).first()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User is inactive or does not exist")
+    return user
+
+def _user_out(user: User) -> dict:
+    return {"id": user.id, "email": user.email, "is_active": user.is_active}
 
 INDEX_INSTRUMENTS = {
     "NIFTY": {"spot": "NSE:NIFTY 50", "name": "NIFTY"},
@@ -159,10 +183,79 @@ def zerodha_option_chain(underlying: str = "NIFTY", db: Session = Depends(get_db
 
 @api.post("/auth/login", response_model=Token)
 def login(body: LoginRequest, db: Session=Depends(get_db)):
-    user=db.query(User).filter(User.email==body.email.strip().lower()).first()
+    user=db.query(User).filter(func.lower(User.email)==body.email.strip().lower()).first()
     if not user or not verify_password(body.password, user.password_hash):
         raise HTTPException(401,"invalid credentials")
     return Token(access_token=create_access_token(user.email))
+
+@api.post("/users", response_model=UserOut, status_code=status.HTTP_201_CREATED)
+def create_user(body: UserCreate, db: Session = Depends(get_db)):
+    email = body.email.strip().lower()
+    if not email:
+        raise HTTPException(422, "Email is required")
+    if db.query(User).filter(func.lower(User.email) == email).first():
+        raise HTTPException(409, "A user with this email already exists")
+    user = User(email=email, password_hash=hash_password(body.password), is_active=body.is_active)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return _user_out(user)
+
+
+@api.get("/users", response_model=list[UserOut])
+def list_users(current_user: User = Depends(_current_user), db: Session = Depends(get_db)):
+    # User records are never returned anonymously. Password hashes are never exposed.
+    return [_user_out(user) for user in db.query(User).order_by(User.id.asc()).all()]
+
+
+@api.get("/users/me", response_model=UserOut)
+def get_current_user(current_user: User = Depends(_current_user)):
+    return _user_out(current_user)
+
+
+@api.get("/users/{user_id}", response_model=UserOut)
+def get_user(user_id: int, current_user: User = Depends(_current_user), db: Session = Depends(get_db)):
+    if current_user.id != user_id:
+        raise HTTPException(403, "You can only access your own user record")
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(404, "User not found")
+    return _user_out(user)
+
+
+@api.put("/users/{user_id}", response_model=UserOut)
+def update_user(user_id: int, body: UserUpdate, current_user: User = Depends(_current_user), db: Session = Depends(get_db)):
+    if current_user.id != user_id:
+        raise HTTPException(403, "You can only update your own user record")
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(404, "User not found")
+    if body.email is not None:
+        email = body.email.strip().lower()
+        duplicate = db.query(User).filter(func.lower(User.email) == email, User.id != user_id).first()
+        if duplicate:
+            raise HTTPException(409, "A user with this email already exists")
+        user.email = email
+    if body.password is not None:
+        user.password_hash = hash_password(body.password)
+    if body.is_active is not None:
+        user.is_active = body.is_active
+    db.commit()
+    db.refresh(user)
+    return _user_out(user)
+
+
+@api.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_user(user_id: int, current_user: User = Depends(_current_user), db: Session = Depends(get_db)):
+    if current_user.id != user_id:
+        raise HTTPException(403, "You can only delete your own user record")
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(404, "User not found")
+    db.delete(user)
+    db.commit()
+    return None
+
 
 @api.get("/broker/status")
 def broker_status(db: Session=Depends(get_db)):
@@ -204,7 +297,7 @@ def _complete_zerodha_callback(request_token: str, db: Session) -> None:
 @api.get("/broker/zerodha/callback")
 def zerodha_callback(request_token: str, db: Session = Depends(get_db)):
     _complete_zerodha_callback(request_token, db)
-    return RedirectResponse("http://localhost:5173/?broker=connected", status_code=303)
+    return RedirectResponse("https://auto-bot-frontend.onrender.com/?broker=connected", status_code=303)
 
 @api.get("/kite/callback", include_in_schema=False)
 def legacy_kite_callback(request_token: str, status: str = "success", db: Session = Depends(get_db)):
@@ -212,7 +305,7 @@ def legacy_kite_callback(request_token: str, status: str = "success", db: Sessio
     if status.lower() != "success":
         raise HTTPException(400, "Kite login was not completed successfully")
     _complete_zerodha_callback(request_token, db)
-    return RedirectResponse("http://localhost:5173/?broker=connected", status_code=303)
+    return RedirectResponse("https://auto-bot-frontend.onrender.com/?broker=connected", status_code=303)
 
 @api.get("/broker/zerodha/quote")
 def zerodha_quote(instrument: str = "NSE:NIFTY 50", db: Session = Depends(get_db)):

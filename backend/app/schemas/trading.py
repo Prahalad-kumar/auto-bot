@@ -28,3 +28,23 @@ class OrderRequest(BaseModel):
     side: str
     quantity: int = Field(gt=0)
     price: float | None = None
+
+
+class UserCreate(BaseModel):
+    email: str
+    password: str = Field(min_length=8, max_length=128)
+    is_active: bool = True
+
+
+class UserUpdate(BaseModel):
+    email: str | None = None
+    password: str | None = Field(default=None, min_length=8, max_length=128)
+    is_active: bool | None = None
+
+
+class UserOut(BaseModel):
+    id: int
+    email: str
+    is_active: bool
+
+    model_config = {"from_attributes": True}
