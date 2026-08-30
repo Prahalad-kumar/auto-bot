@@ -105,23 +105,22 @@ def run_backtest(
 def run_zerodha_backtest(
     from_date: date,
     to_date: date,
-    option_instrument_tokens: str = "",
-    option_tradingsymbols: str = "",
-    selection_mode: str = "MANUAL",
+    option_instrument_token: int,
+    option_tradingsymbol: str,
     underlying: str = "NIFTY",
     initial_capital: float = 100000,
     quantity: int = 1,
     charge_per_order: float = 0,
+    contracts: str | None = None,
+    atm: bool = False,
     db: Session = Depends(get_db),
     current_user: User = Depends(_current_user),
 ):
-    """Run one backtest against one or many real Kite option contracts.
-
-    MANUAL accepts comma-separated instrument tokens/symbols. ATM resolves the
-    nearest strike from the current underlying quote and backtests that contract.
-    """
+    """Fetch real 5-minute candles from Kite then run the PAPER-only backtest."""
     if to_date < from_date:
         raise HTTPException(422, "to_date must be on or after from_date")
+    if quantity < 1:
+        raise HTTPException(422, "quantity must be at least 1")
     try:
         kite = _kite_client(db)
         definition = _underlying_definition(underlying)
@@ -130,57 +129,38 @@ def run_zerodha_backtest(
         if not index:
             raise HTTPException(502, f"Could not resolve {underlying} from Kite")
         underlying_candles = _kite_candles(kite, int(index["instrument_token"]), from_date, to_date, underlying.upper())
-
-        nfo = [item for item in kite.instruments("NFO") if item.get("name") == definition["name"] and item.get("instrument_type") in {"CE", "PE"}]
-        if selection_mode.upper() == "ATM":
-            spot = float(kite.ltp(definition["spot"])[definition["spot"]]["last_price"])
-            expiry = min(item["expiry"] for item in nfo)
-            pool = [x for x in nfo if x["expiry"] == expiry]
-            # ATM means the same nearest strike for BOTH sides. Never select only
-            # one contract: a strategy may generate either a CE or PE signal.
-            atm_strike = min(
-                {float(x["strike"]) for x in pool},
-                key=lambda strike: abs(strike - spot),
-            )
-            selected = [
-                x for x in pool
-                if float(x["strike"]) == atm_strike
-                and x.get("instrument_type") in {"CE", "PE"}
-            ]
-            selected.sort(key=lambda x: x.get("instrument_type", ""))
-        else:
-            tokens = [int(x) for x in option_instrument_tokens.split(",") if x.strip()]
-            symbols = [x.strip() for x in option_tradingsymbols.split(",") if x.strip()]
-            selected = [x for x in nfo if int(x["instrument_token"]) in tokens or x["tradingsymbol"] in symbols]
-        if not selected:
-            raise HTTPException(422, "Select at least one option contract")
-
-        results = []
-        for contract in selected:
-            options = _kite_candles(kite, int(contract["instrument_token"]), from_date, to_date, contract["tradingsymbol"])
-            result = BacktestEngine().run(underlying_candles, options, initial_capital=initial_capital, quantity=quantity or int(contract["lot_size"]), stop_percent=10, target_percent=20, charge_per_order=charge_per_order)
-            result["contract"] = {"instrument_token": contract["instrument_token"], "tradingsymbol": contract["tradingsymbol"], "strike": contract["strike"], "expiry": str(contract["expiry"]), "option_type": contract["instrument_type"], "lot_size": contract["lot_size"]}
-            results.append(result)
-        if len(results) == 1:
-            return results[0]
-        return {"mode": "MULTI_CONTRACT", "results": results, "contracts": [x["contract"] for x in results]}
+        options = _kite_candles(kite, option_instrument_token, from_date, to_date, option_tradingsymbol)
+        return BacktestEngine().run(underlying_candles, options, initial_capital=initial_capital, quantity=quantity, stop_percent=10, target_percent=20, charge_per_order=charge_per_order)
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(502, "Kite historical-data request failed. Check the selected contracts, date range, and data entitlement.") from exc
+        raise HTTPException(502, "Kite historical-data request failed. Check the selected contract, date range, and your data entitlement.") from exc
 
 @api.get("/broker/zerodha/options")
-def zerodha_options(underlying: str = "NIFTY", current_user: User = Depends(_current_user), db: Session = Depends(get_db)):
+def zerodha_options(underlying: str = "NIFTY", db: Session = Depends(get_db)):
     """List active index option contracts for selecting a direct-data backtest."""
     try:
         kite = _kite_client(db)
         definition = _underlying_definition(underlying)
-        contracts = [item for item in kite.instruments("NFO") if item.get("name") == definition["name"] and item.get("instrument_type") in {"CE", "PE"}]
-        return [{"instrument_token": item["instrument_token"], "tradingsymbol": item["tradingsymbol"], "expiry": str(item["expiry"]), "strike": item["strike"], "option_type": item["instrument_type"], "lot_size": item["lot_size"]} for item in contracts]
+        contracts = [
+            item for item in kite.instruments("NFO")
+            if item.get("name") == definition["name"] and item.get("instrument_type") in {"CE", "PE"}
+        ]
+        return [
+            {
+                "instrument_token": item["instrument_token"],
+                "tradingsymbol": item["tradingsymbol"],
+                "expiry": str(item["expiry"]),
+                "strike": float(item["strike"]),
+                "option_type": item["instrument_type"],
+                "lot_size": int(item["lot_size"]),
+            }
+            for item in contracts
+        ]
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(502, "Could not load NIFTY option instruments from Kite") from exc
+        raise HTTPException(502, "Could not load index option instruments from Kite") from exc
 
 @api.get("/broker/zerodha/option-underlyings")
 def zerodha_option_underlyings(current_user: User = Depends(_current_user), db: Session = Depends(get_db)):
