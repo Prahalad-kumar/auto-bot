@@ -3,14 +3,14 @@ import json
 from io import BytesIO
 from datetime import date
 import pandas as pd
-from fastapi import File, UploadFile
+from fastapi import File, UploadFile, Query, WebSocket, WebSocketDisconnect
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import RedirectResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from app.db.session import get_db
-from app.models import User, Strategy, Signal, Order, Position, Trade, BrokerConnection
+from app.models import User, Strategy, Signal, Order, Position, Trade, BrokerConnection, AuditLog
 from app.schemas.trading import LoginRequest, Token, StrategyCreate, UserCreate, UserUpdate, UserOut
 from app.core.security import hash_password, verify_password, create_access_token
 from jose import JWTError, jwt
@@ -105,15 +105,21 @@ def run_backtest(
 def run_zerodha_backtest(
     from_date: date,
     to_date: date,
-    option_instrument_token: int,
-    option_tradingsymbol: str,
+    option_instrument_tokens: str = "",
+    option_tradingsymbols: str = "",
+    selection_mode: str = "MANUAL",
     underlying: str = "NIFTY",
     initial_capital: float = 100000,
     quantity: int = 1,
     charge_per_order: float = 0,
     db: Session = Depends(get_db),
+    current_user: User = Depends(_current_user),
 ):
-    """Fetch real 5-minute candles from Kite then run the PAPER-only backtest."""
+    """Run one backtest against one or many real Kite option contracts.
+
+    MANUAL accepts comma-separated instrument tokens/symbols. ATM resolves the
+    nearest strike from the current underlying quote and backtests that contract.
+    """
     if to_date < from_date:
         raise HTTPException(422, "to_date must be on or after from_date")
     try:
@@ -124,15 +130,37 @@ def run_zerodha_backtest(
         if not index:
             raise HTTPException(502, f"Could not resolve {underlying} from Kite")
         underlying_candles = _kite_candles(kite, int(index["instrument_token"]), from_date, to_date, underlying.upper())
-        options = _kite_candles(kite, option_instrument_token, from_date, to_date, option_tradingsymbol)
-        return BacktestEngine().run(underlying_candles, options, initial_capital=initial_capital, quantity=quantity, stop_percent=10, target_percent=20, charge_per_order=charge_per_order)
+
+        nfo = [item for item in kite.instruments("NFO") if item.get("name") == definition["name"] and item.get("instrument_type") in {"CE", "PE"}]
+        if selection_mode.upper() == "ATM":
+            spot = float(kite.ltp(definition["spot"])[definition["spot"]]["last_price"])
+            expiry = min(item["expiry"] for item in nfo)
+            pool = [x for x in nfo if x["expiry"] == expiry]
+            atm = min(pool, key=lambda x: abs(float(x["strike"]) - spot))
+            selected = [atm]
+        else:
+            tokens = [int(x) for x in option_instrument_tokens.split(",") if x.strip()]
+            symbols = [x.strip() for x in option_tradingsymbols.split(",") if x.strip()]
+            selected = [x for x in nfo if int(x["instrument_token"]) in tokens or x["tradingsymbol"] in symbols]
+        if not selected:
+            raise HTTPException(422, "Select at least one option contract")
+
+        results = []
+        for contract in selected:
+            options = _kite_candles(kite, int(contract["instrument_token"]), from_date, to_date, contract["tradingsymbol"])
+            result = BacktestEngine().run(underlying_candles, options, initial_capital=initial_capital, quantity=quantity or int(contract["lot_size"]), stop_percent=10, target_percent=20, charge_per_order=charge_per_order)
+            result["contract"] = {"instrument_token": contract["instrument_token"], "tradingsymbol": contract["tradingsymbol"], "strike": contract["strike"], "expiry": str(contract["expiry"]), "option_type": contract["instrument_type"], "lot_size": contract["lot_size"]}
+            results.append(result)
+        if len(results) == 1:
+            return results[0]
+        return {"mode": "MULTI_CONTRACT", "results": results, "contracts": [x["contract"] for x in results]}
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(502, "Kite historical-data request failed. Check the selected contract, date range, and your data entitlement.") from exc
+        raise HTTPException(502, "Kite historical-data request failed. Check the selected contracts, date range, and data entitlement.") from exc
 
 @api.get("/broker/zerodha/options")
-def zerodha_options(underlying: str = "NIFTY", db: Session = Depends(get_db)):
+def zerodha_options(underlying: str = "NIFTY", current_user: User = Depends(_current_user), db: Session = Depends(get_db)):
     """List active index option contracts for selecting a direct-data backtest."""
     try:
         kite = _kite_client(db)
@@ -145,7 +173,7 @@ def zerodha_options(underlying: str = "NIFTY", db: Session = Depends(get_db)):
         raise HTTPException(502, "Could not load NIFTY option instruments from Kite") from exc
 
 @api.get("/broker/zerodha/option-underlyings")
-def zerodha_option_underlyings(db: Session = Depends(get_db)):
+def zerodha_option_underlyings(current_user: User = Depends(_current_user), db: Session = Depends(get_db)):
     """Discover every underlying that currently has an option contract in Kite."""
     try:
         kite = _kite_client(db)
@@ -157,7 +185,7 @@ def zerodha_option_underlyings(db: Session = Depends(get_db)):
         raise HTTPException(502, "Could not load option underlyings from Kite") from exc
 
 @api.get("/broker/zerodha/option-chain")
-def zerodha_option_chain(underlying: str = "NIFTY", db: Session = Depends(get_db)):
+def zerodha_option_chain(underlying: str = "NIFTY", current_user: User = Depends(_current_user), db: Session = Depends(get_db)):
     """Return a compact live option chain around the current ATM strike."""
     try:
         kite = _kite_client(db)
@@ -258,7 +286,7 @@ def delete_user(user_id: int, current_user: User = Depends(_current_user), db: S
 
 
 @api.get("/broker/status")
-def broker_status(db: Session=Depends(get_db)):
+def broker_status(current_user: User = Depends(_current_user), db: Session=Depends(get_db)):
     c=db.query(BrokerConnection).filter(BrokerConnection.broker=="ZERODHA").first()
     return {"broker":"ZERODHA","status":c.status if c else "DISCONNECTED"}
 
@@ -308,7 +336,7 @@ def legacy_kite_callback(request_token: str, status: str = "success", db: Sessio
     return RedirectResponse("https://auto-bot-frontend.onrender.com/?broker=connected", status_code=303)
 
 @api.get("/broker/zerodha/quote")
-def zerodha_quote(instrument: str = "NSE:NIFTY 50", db: Session = Depends(get_db)):
+def zerodha_quote(instrument: str = "NSE:NIFTY 50", current_user: User = Depends(_current_user), db: Session = Depends(get_db)):
     """Read a live quote only after the user completed Kite's session login."""
     connection = db.query(BrokerConnection).filter(BrokerConnection.broker == "ZERODHA").first()
     if not connection or connection.status != "CONNECTED" or not connection.access_token:
@@ -329,11 +357,11 @@ def zerodha_quote(instrument: str = "NSE:NIFTY 50", db: Session = Depends(get_db
         raise HTTPException(502, "Unable to read Zerodha quote; reconnect your Kite session.") from exc
 
 @api.get("/strategies")
-def strategies(db: Session=Depends(get_db)):
+def strategies(current_user: User = Depends(_current_user), db: Session=Depends(get_db)):
     return db.query(Strategy).all()
 
 @api.get("/dashboard/summary")
-def dashboard_summary(db: Session = Depends(get_db)):
+def dashboard_summary(current_user: User = Depends(_current_user), db: Session = Depends(get_db)):
     """Performance summary from persisted strategy signals and completed trades."""
     calls = db.query(func.count(Signal.id)).scalar() or 0
     successful = db.query(func.count(Trade.id)).filter(Trade.net_pnl > 0).scalar() or 0
@@ -351,27 +379,27 @@ def dashboard_summary(db: Session = Depends(get_db)):
     }
 
 @api.get("/notifications")
-def notifications(db: Session = Depends(get_db)):
+def notifications(current_user: User = Depends(_current_user), db: Session = Depends(get_db)):
     return db.query(AuditLog).filter(AuditLog.event == "PAPER_ORDER_EXECUTED").order_by(AuditLog.timestamp.desc()).limit(20).all()
 
 @api.post("/strategies")
-def create_strategy(body: StrategyCreate, db: Session=Depends(get_db)):
+def create_strategy(body: StrategyCreate, current_user: User = Depends(_current_user), db: Session=Depends(get_db)):
     s=Strategy(name=body.name, config=body.config)
     db.add(s); db.commit(); db.refresh(s)
     return s
 
 @api.post("/trading/start")
-def start_trading():
+def start_trading(current_user: User = Depends(_current_user)):
     if settings.TRADING_MODE == "LIVE" and not settings.LIVE_TRADING_ENABLED:
         raise HTTPException(403,"LIVE_TRADING_ENABLED is false")
     return {"status":"STARTED","mode":settings.TRADING_MODE}
 
 @api.post("/trading/stop")
-def stop_trading():
+def stop_trading(current_user: User = Depends(_current_user)):
     return {"status":"STOPPED"}
 
 @api.post("/trading/live/enable")
-def enable_live():
+def enable_live(current_user: User = Depends(_current_user)):
     if settings.TRADING_MODE != "LIVE":
         raise HTTPException(403,"Set TRADING_MODE=LIVE first")
     if not settings.LIVE_TRADING_ENABLED:
@@ -379,17 +407,51 @@ def enable_live():
     return {"status":"LIVE_ENABLED","warning":"REAL MONEY — LIVE TRADING"}
 
 @api.post("/trading/emergency-stop")
-def emergency_stop():
+def emergency_stop(current_user: User = Depends(_current_user)):
     return {"status":"HALTED","message":"New signals and order submissions must remain disabled until explicit reset"}
 
 @api.get("/orders")
-def orders(db: Session=Depends(get_db)):
+def orders(current_user: User = Depends(_current_user), db: Session=Depends(get_db)):
     return db.query(Order).order_by(Order.id.desc()).limit(200).all()
 
 @api.get("/positions")
-def positions(db: Session=Depends(get_db)):
+def positions(current_user: User = Depends(_current_user), db: Session=Depends(get_db)):
     return db.query(Position).filter(Position.status=="OPEN").all()
 
 @api.get("/trades")
-def trades(db: Session=Depends(get_db)):
+def trades(current_user: User = Depends(_current_user), db: Session=Depends(get_db)):
     return db.query(Trade).order_by(Trade.id.desc()).limit(200).all()
+
+
+@api.websocket("/ws/events")
+async def websocket_events(websocket: WebSocket):
+    """Authenticated Redis-backed event stream for the trading terminal."""
+    token = websocket.query_params.get("token")
+    if not token:
+        await websocket.close(code=1008, reason="Authentication required")
+        return
+    try:
+        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=["HS256"])
+        if not payload.get("sub"):
+            raise ValueError
+    except Exception:
+        await websocket.close(code=1008, reason="Invalid token")
+        return
+    await websocket.accept()
+    from redis.asyncio import Redis
+    client = Redis.from_url(settings.REDIS_URL, decode_responses=True)
+    pubsub = client.pubsub()
+    await pubsub.subscribe("autobot:events")
+    try:
+        while True:
+            message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+            if message and message.get("type") == "message":
+                await websocket.send_text(message["data"])
+            else:
+                await websocket.send_json({"type": "heartbeat"})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await pubsub.unsubscribe("autobot:events")
+        await pubsub.close()
+        await client.aclose()
