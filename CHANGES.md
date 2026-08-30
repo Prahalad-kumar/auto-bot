@@ -26,3 +26,9 @@ This archive is a complete source tree. The upgrade is not represented only by n
 - `PYTHONPATH=backend python -m compileall -q backend/app` — passed.
 - `PYTHONPATH=backend pytest -q` — 4 passed.
 - Frontend dependencies were not installed in the build environment, so `npm run build` must be run in a normal Node environment before deployment.
+
+
+## Final UI and ATM touch-up
+- Polished the login screen with secure-session messaging, password visibility toggle, loading state, and responsive styling.
+- ATM backtests now select BOTH the nearest-strike CE and PE for the selected expiry.
+- Added an explicit ATM Call + Put explanation in the backtest UI.

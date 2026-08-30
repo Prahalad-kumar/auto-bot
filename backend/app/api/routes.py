@@ -136,8 +136,18 @@ def run_zerodha_backtest(
             spot = float(kite.ltp(definition["spot"])[definition["spot"]]["last_price"])
             expiry = min(item["expiry"] for item in nfo)
             pool = [x for x in nfo if x["expiry"] == expiry]
-            atm = min(pool, key=lambda x: abs(float(x["strike"]) - spot))
-            selected = [atm]
+            # ATM means the same nearest strike for BOTH sides. Never select only
+            # one contract: a strategy may generate either a CE or PE signal.
+            atm_strike = min(
+                {float(x["strike"]) for x in pool},
+                key=lambda strike: abs(strike - spot),
+            )
+            selected = [
+                x for x in pool
+                if float(x["strike"]) == atm_strike
+                and x.get("instrument_type") in {"CE", "PE"}
+            ]
+            selected.sort(key=lambda x: x.get("instrument_type", ""))
         else:
             tokens = [int(x) for x in option_instrument_tokens.split(",") if x.strip()]
             symbols = [x.strip() for x in option_tradingsymbols.split(",") if x.strip()]
