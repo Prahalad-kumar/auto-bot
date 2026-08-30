@@ -1,4 +1,5 @@
 from dataclasses import asdict, dataclass
+from math import sqrt
 from typing import Iterable
 
 from app.services.market_data.candles import Candle
@@ -53,22 +54,22 @@ def _macd_series(values: list[float], fast: int = 8, slow: int = 16, signal: int
     return line, signal_values
 
 
-def _crosses_above(left, right, index: int) -> bool:
+def _crosses_above(left: list[float | None], right: list[float | None], index: int) -> bool:
     return index > 0 and None not in (left[index - 1], right[index - 1], left[index], right[index]) and left[index - 1] <= right[index - 1] and left[index] > right[index]
 
 
-def _crosses_below(left, right, index: int) -> bool:
+def _crosses_below(left: list[float | None], right: list[float | None], index: int) -> bool:
     return index > 0 and None not in (left[index - 1], right[index - 1], left[index], right[index]) and left[index - 1] >= right[index - 1] and left[index] < right[index]
 
 
 class BacktestEngine:
-    """Completed-candle PAPER backtest for the configured EMA/MACD option strategy."""
+    """Completed-candle backtest for the confirmed NIFTY EMA/MACD option strategy."""
 
     def run(self, underlying: Iterable[Candle], options: Iterable[Candle], *, initial_capital: float = 100000, quantity: int = 1, stop_percent: float = 10, target_percent: float = 20, charge_per_order: float = 0) -> dict:
         underlying = sorted(underlying, key=lambda candle: candle.timestamp)
         option_by_time = {candle.timestamp: candle for candle in options}
         if len(underlying) < 20:
-            raise ValueError("At least 20 completed index 5-minute candles are required")
+            raise ValueError("At least 20 completed NIFTY 5-minute candles are required")
         if quantity < 1 or stop_percent <= 0 or target_percent <= 0:
             raise ValueError("Quantity, stop loss, and target must be positive")
         closes = [candle.close for candle in underlying]
@@ -89,30 +90,26 @@ class BacktestEngine:
                 stop_hit = option.low <= active["stop"]
                 target_hit = option.high >= active["target"]
                 if stop_hit or target_hit:
+                    # A single OHLC bar cannot prove the intrabar sequence; protect
+                    # the backtest from optimistic bias by prioritising the stop.
                     exit_price = active["stop"] if stop_hit else active["target"]
                     gross = (exit_price - active["entry"]) * quantity
                     charges = charge_per_order * 2
                     net = gross - charges
                     equity += net
-                    trades.append(BacktestTrade(active["side"], active["option_type"], option.tradingsymbol or active.get("symbol") or "OPTION", active["time"].isoformat(), option.timestamp.isoformat(), active["entry"], exit_price, quantity, round(active["entry"] * quantity, 2), active["stop"], active["target"], "STOP_LOSS" if stop_hit else "TARGET", gross, charges, net))
+                    trades.append(BacktestTrade(active["side"], active["option_type"], option.tradingsymbol or "OPTION", active["time"].isoformat(), option.timestamp.isoformat(), active["entry"], exit_price, quantity, round(active["entry"] * quantity, 2), active["stop"], active["target"], "STOP_LOSS" if stop_hit else "TARGET", gross, charges, net))
                     active = None
             if active is None and i + 1 < len(underlying):
                 lookback = range(max(1, i - 2), i + 1)
-                up_indexes = [j for j in lookback if ema_up[j]]
-                macd_up_indexes = [j for j in lookback if macd_up[j]]
-                down_indexes = [j for j in lookback if ema_down[j]]
-                macd_down_indexes = [j for j in lookback if macd_down[j]]
-                bullish = bool(up_indexes and macd_up_indexes and any(abs(a - b) <= 2 for a in up_indexes for b in macd_up_indexes))
-                bearish = bool(down_indexes and macd_down_indexes and any(abs(a - b) <= 2 for a in down_indexes for b in macd_down_indexes))
+                bullish = any(ema_up[j] for j in lookback) and any(macd_up[j] for j in lookback) and any(abs(a - b) <= 2 for a in [j for j in lookback if ema_up[j]] for b in [j for j in lookback if macd_up[j]])
+                bearish = any(ema_down[j] for j in lookback) and any(macd_down[j] for j in lookback) and any(abs(a - b) <= 2 for a in [j for j in lookback if ema_down[j]] for b in [j for j in lookback if macd_down[j]])
                 if bullish or bearish:
                     entry_candle = option_by_time.get(underlying[i + 1].timestamp)
                     required_type = "CE" if bullish else "PE"
-                    symbol = (entry_candle.tradingsymbol or "").upper() if entry_candle else ""
-                    if entry_candle and symbol.endswith(required_type):
+                    if entry_candle and (entry_candle.tradingsymbol or "").upper().endswith(required_type):
                         entry = entry_candle.open
-                        active = {"side": "BUY", "option_type": required_type, "symbol": entry_candle.tradingsymbol, "entry": entry, "stop": entry * (1 - stop_percent / 100), "target": entry * (1 + target_percent / 100), "time": entry_candle.timestamp}
+                        active = {"side": "BUY", "option_type": required_type, "entry": entry, "stop": entry * (1 - stop_percent / 100), "target": entry * (1 + target_percent / 100), "time": entry_candle.timestamp}
             equity_curve.append({"timestamp": underlying[i].timestamp.isoformat(), "equity": round(equity, 2)})
-
         if active:
             final = option_by_time.get(underlying[-1].timestamp)
             if final:
@@ -120,8 +117,7 @@ class BacktestEngine:
                 charges = charge_per_order * 2
                 net = gross - charges
                 equity += net
-                trades.append(BacktestTrade(active["side"], active["option_type"], final.tradingsymbol or active.get("symbol") or "OPTION", active["time"].isoformat(), final.timestamp.isoformat(), active["entry"], final.close, quantity, round(active["entry"] * quantity, 2), active["stop"], active["target"], "END_OF_DATA", gross, charges, net))
-
+                trades.append(BacktestTrade(active["side"], active["option_type"], final.tradingsymbol or "OPTION", active["time"].isoformat(), final.timestamp.isoformat(), active["entry"], final.close, quantity, round(active["entry"] * quantity, 2), active["stop"], active["target"], "END_OF_DATA", gross, charges, net))
         net_values = [trade.net_pnl for trade in trades]
         wins = [value for value in net_values if value > 0]
         losses = [value for value in net_values if value < 0]
@@ -129,8 +125,4 @@ class BacktestEngine:
         for point in equity_curve:
             peak = max(peak, point["equity"])
             max_drawdown = min(max_drawdown, point["equity"] - peak)
-        return {
-            "summary": {"initial_capital": initial_capital, "final_capital": round(equity, 2), "net_pnl": round(equity - initial_capital, 2), "return_percent": round((equity / initial_capital - 1) * 100, 2), "trades": len(trades), "winning_trades": len(wins), "losing_trades": len(losses), "win_rate": round(len(wins) / len(trades) * 100, 2) if trades else 0, "average_win": round(sum(wins) / len(wins), 2) if wins else 0, "average_loss": round(sum(losses) / len(losses), 2) if losses else 0, "profit_factor": round(sum(wins) / abs(sum(losses)), 2) if losses else None, "max_drawdown": round(max_drawdown, 2)},
-            "trades": [asdict(trade) for trade in trades],
-            "equity_curve": equity_curve,
-        }
+        return {"summary": {"initial_capital": initial_capital, "final_capital": round(equity, 2), "net_pnl": round(equity - initial_capital, 2), "return_percent": round((equity / initial_capital - 1) * 100, 2), "trades": len(trades), "winning_trades": len(wins), "losing_trades": len(losses), "win_rate": round(len(wins) / len(trades) * 100, 2) if trades else 0, "average_win": round(sum(wins) / len(wins), 2) if wins else 0, "average_loss": round(sum(losses) / len(losses), 2) if losses else 0, "profit_factor": round(sum(wins) / abs(sum(losses)), 2) if losses else None, "max_drawdown": round(max_drawdown, 2)}, "trades": [asdict(trade) for trade in trades], "equity_curve": equity_curve}

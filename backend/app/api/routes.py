@@ -107,8 +107,6 @@ def run_zerodha_backtest(
     to_date: date,
     underlying: str = "NIFTY",
     selection_mode: str = Query("ATM", pattern="^(ATM|MANUAL)$"),
-    option_instrument_token: int | None = None,
-    option_tradingsymbol: str | None = None,
     option_instrument_tokens: str | None = None,
     option_tradingsymbols: str | None = None,
     initial_capital: float = 100000,
@@ -117,125 +115,117 @@ def run_zerodha_backtest(
     db: Session = Depends(get_db),
     current_user: User = Depends(_current_user),
 ):
-    """Run a PAPER-only Zerodha historical backtest.
+    """Run a PAPER backtest using real Kite 5-minute candles.
 
-    ATM resolves the nearest strike and automatically tests BOTH CE and PE at
-    the same expiry/strike. MANUAL accepts one or more comma-separated
-    instrument tokens/trading symbols. The old single-contract parameters are
-    retained as backwards-compatible aliases.
+    ATM mode automatically resolves both CE and PE at the same nearest strike
+    for the first underlying price in the requested period. MANUAL mode accepts
+    comma-separated instrument tokens and trading symbols.
     """
     if to_date < from_date:
         raise HTTPException(422, "to_date must be on or after from_date")
     if quantity < 1:
         raise HTTPException(422, "quantity must be at least 1")
-    if initial_capital <= 0:
-        raise HTTPException(422, "initial_capital must be positive")
+    mode = selection_mode.upper()
     try:
         kite = _kite_client(db)
         definition = _underlying_definition(underlying)
+
+        # Resolve the index instrument and fetch the underlying candles once.
         instruments = kite.instruments("NSE")
-        index = next((item for item in instruments if item.get("tradingsymbol") == definition["spot"].split(":", 1)[1]), None)
+        index_symbol = definition["spot"].split(":", 1)[1]
+        index = next((item for item in instruments if item.get("tradingsymbol") == index_symbol), None)
         if not index:
             raise HTTPException(502, f"Could not resolve {underlying} from Kite")
-        underlying_candles = _kite_candles(kite, int(index["instrument_token"]), from_date, to_date, underlying.upper())
+        underlying_candles = _kite_candles(
+            kite, int(index["instrument_token"]), from_date, to_date, underlying.upper()
+        )
 
-        nfo = [item for item in kite.instruments("NFO") if item.get("name") == definition["name"] and item.get("instrument_type") in {"CE", "PE"}]
+        nfo = [
+            item for item in kite.instruments("NFO")
+            if item.get("name") == definition["name"]
+            and item.get("instrument_type") in {"CE", "PE"}
+        ]
         if not nfo:
-            raise HTTPException(422, f"No option contracts found for {underlying.upper()}")
+            raise HTTPException(422, f"No {underlying.upper()} option contracts were returned by Kite")
 
-        if selection_mode == "ATM":
-            eligible_expiries = sorted({item["expiry"] for item in nfo if item.get("expiry") and item["expiry"] >= from_date})
-            if not eligible_expiries:
-                raise HTTPException(422, "No option expiry is available for the selected backtest date")
-            expiry = eligible_expiries[0]
-            expiry_contracts = [item for item in nfo if item.get("expiry") == expiry]
+        selected_contracts: list[dict] = []
+        if mode == "ATM":
+            # Use the first available underlying close to establish the ATM strike
+            # for the selected historical period. Both CE and PE use that same strike.
             spot = float(underlying_candles[0].close)
+            expiries = sorted({item["expiry"] for item in nfo if item.get("expiry") is not None})
+            valid_expiries = [expiry for expiry in expiries if expiry >= from_date]
+            expiry = min(valid_expiries or expiries)
+            expiry_contracts = [item for item in nfo if item.get("expiry") == expiry]
             strikes = sorted({float(item["strike"]) for item in expiry_contracts})
             if not strikes:
-                raise HTTPException(422, "No strikes available for the selected expiry")
+                raise HTTPException(422, f"No strikes available for {underlying.upper()} expiry {expiry}")
             atm_strike = min(strikes, key=lambda strike: abs(strike - spot))
-            selected = [item for item in expiry_contracts if float(item["strike"]) == atm_strike and item.get("instrument_type") in {"CE", "PE"}]
-            selected_types = {item.get("instrument_type") for item in selected}
-            if not {"CE", "PE"}.issubset(selected_types):
-                raise HTTPException(422, f"ATM strike {atm_strike:g} does not have both CE and PE for expiry {expiry}")
+            selected_contracts = [
+                item for item in expiry_contracts
+                if float(item["strike"]) == atm_strike and item.get("instrument_type") in {"CE", "PE"}
+            ]
+            selected_contracts.sort(key=lambda item: item["instrument_type"])
+            if {item.get("instrument_type") for item in selected_contracts} != {"CE", "PE"}:
+                raise HTTPException(422, f"Could not resolve both ATM CE and PE for {underlying.upper()} {atm_strike}")
         else:
-            tokens = []
-            symbols = []
-            if option_instrument_tokens:
-                tokens.extend(int(value.strip()) for value in option_instrument_tokens.split(",") if value.strip())
-            if option_instrument_token is not None:
-                tokens.append(option_instrument_token)
-            if option_tradingsymbols:
-                symbols.extend(value.strip().upper() for value in option_tradingsymbols.split(",") if value.strip())
-            if option_tradingsymbol:
-                symbols.append(option_tradingsymbol.strip().upper())
-            token_set = set(tokens)
-            symbol_set = set(symbols)
-            selected = [item for item in nfo if int(item["instrument_token"]) in token_set or str(item["tradingsymbol"]).upper() in symbol_set]
-            if not selected:
-                raise HTTPException(422, "MANUAL selection requires at least one valid option instrument")
+            tokens = [int(x.strip()) for x in (option_instrument_tokens or "").split(",") if x.strip()]
+            symbols = [x.strip() for x in (option_tradingsymbols or "").split(",") if x.strip()]
+            if not tokens or not symbols or len(tokens) != len(symbols):
+                raise HTTPException(422, "MANUAL selection requires matching option_instrument_tokens and option_tradingsymbols")
+            by_token = {int(item["instrument_token"]): item for item in nfo}
+            by_symbol = {str(item["tradingsymbol"]): item for item in nfo}
+            for token, symbol in zip(tokens, symbols):
+                item = by_token.get(token) or by_symbol.get(symbol)
+                if not item:
+                    raise HTTPException(422, f"Option contract not found in Kite instruments: {symbol}")
+                selected_contracts.append(item)
 
-        engine = BacktestEngine()
         results = []
-        for contract in selected:
-            candles = _kite_candles(kite, int(contract["instrument_token"]), from_date, to_date, str(contract["tradingsymbol"]))
-            # One lot is the safest default for option backtests. quantity is
-            # interpreted as number of lots when the selected contract exposes
-            # a lot_size; the response reports both lots and actual quantity.
+        for contract in selected_contracts:
+            token = int(contract["instrument_token"])
+            symbol = str(contract["tradingsymbol"])
             lot_size = int(contract.get("lot_size") or 1)
-            result = engine.run(
+            # quantity means lots in the API; one lot is the safe default.
+            effective_quantity = lot_size * quantity
+            options = _kite_candles(kite, token, from_date, to_date, symbol)
+            result = BacktestEngine().run(
                 underlying_candles,
-                candles,
+                options,
                 initial_capital=initial_capital,
-                quantity=quantity * lot_size,
+                quantity=effective_quantity,
                 stop_percent=10,
                 target_percent=20,
                 charge_per_order=charge_per_order,
             )
-            metadata = {
-                "instrument_token": int(contract["instrument_token"]),
-                "tradingsymbol": str(contract["tradingsymbol"]),
-                "underlying": underlying.upper(),
-                "expiry": str(contract["expiry"]),
-                "strike": float(contract["strike"]),
-                "option_type": str(contract["instrument_type"]),
-                "lot_size": lot_size,
-                "lots": quantity,
-            }
-            for trade in result["trades"]:
-                trade.update({"expiry": metadata["expiry"], "strike": metadata["strike"], "lot_size": lot_size, "lots": quantity, "instrument_token": metadata["instrument_token"]})
-            result["contract"] = metadata
-            results.append(result)
+            results.append({
+                "contract": {
+                    "instrument_token": token,
+                    "tradingsymbol": symbol,
+                    "expiry": str(contract.get("expiry")),
+                    "strike": float(contract.get("strike") or 0),
+                    "option_type": contract.get("instrument_type"),
+                    "lot_size": lot_size,
+                    "lots": quantity,
+                },
+                "summary": result["summary"],
+                "trades": result["trades"],
+                "equity_curve": result["equity_curve"],
+            })
 
-        # Always return a consistent multi-contract shape. For a single manual
-        # contract the first result is also exposed at top level for compatibility.
-        aggregate_pnl = round(sum(item["summary"]["net_pnl"] for item in results), 2)
-        response = {
-            "selection_mode": selection_mode,
+        combined_pnl = round(sum(item["summary"]["net_pnl"] for item in results), 2)
+        return {
+            "selection_mode": mode,
             "underlying": underlying.upper(),
             "from_date": str(from_date),
             "to_date": str(to_date),
-            "contracts": [item["contract"] for item in results],
             "results": results,
-            "summary": {
-                "contracts": len(results),
-                "net_pnl": aggregate_pnl,
-                "trades": sum(item["summary"]["trades"] for item in results),
-                "winning_trades": sum(item["summary"]["winning_trades"] for item in results),
-                "losing_trades": sum(item["summary"]["losing_trades"] for item in results),
-            },
+            "combined": {"net_pnl": combined_pnl, "contracts": len(results)},
         }
-        if len(results) == 1:
-            response["trades"] = results[0]["trades"]
-            response["equity_curve"] = results[0]["equity_curve"]
-        return response
     except HTTPException:
         raise
-    except ValueError as exc:
-        raise HTTPException(422, str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(502, "Kite historical-data request failed. Check the selected contracts, date range, and your data entitlement.") from exc
-
+        raise HTTPException(502, "Kite historical-data request failed. Check the selected contract, date range, and your data entitlement.") from exc
 
 @api.get("/broker/zerodha/options")
 def zerodha_options(underlying: str = "NIFTY", db: Session = Depends(get_db)):
