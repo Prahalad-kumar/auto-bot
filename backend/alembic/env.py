@@ -1,17 +1,12 @@
 import os
-from logging.config import fileConfig
 
 from sqlalchemy import create_engine, pool
-
 from alembic import context
 
 from app.db.session import Base
 from app.models import models
 
 config = context.config
-
-if config.config_file_name:
-    fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata
 
@@ -22,6 +17,7 @@ def get_database_url():
     if not database_url:
         raise RuntimeError("DATABASE_URL environment variable is not set")
 
+    # Handle Render URLs that may use postgres://
     if database_url.startswith("postgres://"):
         database_url = database_url.replace(
             "postgres://",
