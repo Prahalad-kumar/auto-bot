@@ -1,0 +1,22 @@
+{
+  "strategy_id": "nifty-ema-macd-atm-v1",
+  "name": "NIFTY 5m EMA/MACD ATM Options",
+  "enabled": false,
+  "execution_mode": "PAPER",
+  "underlying": "NIFTY",
+  "timeframe": "5m",
+  "indicators": [
+    {"name": "ema_5", "type": "EMA", "params": {"length": 5}},
+    {"name": "ema_10", "type": "EMA", "params": {"length": 10}},
+    {"name": "macd", "type": "MACD", "params": {"fast": 8, "slow": 16, "signal": 3}}
+  ],
+  "entry_rules": {
+    "bullish": {"ema_cross": "EMA_5_CROSS_ABOVE_EMA_10", "macd_cross": "MACD_CROSS_ABOVE_SIGNAL_WITHIN_2_COMPLETED_CANDLES", "confirmation": "ENTER_AFTER_CONFIRMATION_CANDLE_CLOSE", "option_type": "CE"},
+    "bearish": {"ema_cross": "EMA_5_CROSS_BELOW_EMA_10", "macd_cross": "MACD_CROSS_BELOW_SIGNAL_WITHIN_2_COMPLETED_CANDLES", "confirmation": "ENTER_AFTER_CONFIRMATION_CANDLE_CLOSE", "option_type": "PE"}
+  },
+  "option_selection": {"moneyness": "ATM", "expiry": "NEAREST_AVAILABLE_WEEKLY", "lots": 1, "instrument_validation": "REQUIRED"},
+  "risk": {"stop_loss": {"type": "OPTION_PERCENT", "percent": 10}, "target": {"type": "OPTION_PERCENT", "percent": 20}, "risk_reward_ratio": 2, "max_open_positions": 1, "max_trades_per_day": 5},
+  "trading_session": {"start": "09:15", "end": "15:30", "timezone": "Asia/Kolkata"},
+  "requires_confirmation": false,
+  "notes": "Signals use completed underlying candles. Execution and SL/target use the selected ATM option price."
+}

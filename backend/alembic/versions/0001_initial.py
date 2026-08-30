@@ -1,0 +1,14 @@
+from alembic import op
+import sqlalchemy as sa
+revision="0001_initial"; down_revision=None; branch_labels=None; depends_on=None
+def upgrade():
+    op.create_table("users",sa.Column("id",sa.Integer,primary_key=True),sa.Column("email",sa.String(255),unique=True,index=True),sa.Column("password_hash",sa.String(255)),sa.Column("is_active",sa.Boolean,default=True))
+    op.create_table("strategies",sa.Column("id",sa.Integer,primary_key=True),sa.Column("name",sa.String(120)),sa.Column("config",sa.JSON),sa.Column("enabled",sa.Boolean),sa.Column("created_at",sa.DateTime(timezone=True)))
+    op.create_table("signals",sa.Column("id",sa.Integer,primary_key=True),sa.Column("strategy_id",sa.Integer,index=True),sa.Column("action",sa.String(20)),sa.Column("underlying",sa.String(40)),sa.Column("option_type",sa.String(2)),sa.Column("strike",sa.Float),sa.Column("reason",sa.Text),sa.Column("timestamp",sa.DateTime(timezone=True),index=True))
+    op.create_table("orders",sa.Column("id",sa.Integer,primary_key=True),sa.Column("client_order_id",sa.String(80),unique=True,index=True),sa.Column("broker_order_id",sa.String(80)),sa.Column("symbol",sa.String(100)),sa.Column("side",sa.String(10)),sa.Column("quantity",sa.Integer),sa.Column("price",sa.Float),sa.Column("status",sa.String(30)),sa.Column("mode",sa.String(20)),sa.Column("created_at",sa.DateTime(timezone=True)))
+    op.create_table("positions",sa.Column("id",sa.Integer,primary_key=True),sa.Column("symbol",sa.String(100),index=True),sa.Column("underlying",sa.String(40)),sa.Column("quantity",sa.Integer),sa.Column("average_price",sa.Float),sa.Column("stop_loss",sa.Float),sa.Column("target",sa.Float),sa.Column("realized_pnl",sa.Float),sa.Column("unrealized_pnl",sa.Float),sa.Column("status",sa.String(20)))
+    op.create_table("trades",sa.Column("id",sa.Integer,primary_key=True),sa.Column("strategy",sa.String(120)),sa.Column("symbol",sa.String(100)),sa.Column("entry_price",sa.Float),sa.Column("exit_price",sa.Float),sa.Column("quantity",sa.Integer),sa.Column("gross_pnl",sa.Float),sa.Column("charges",sa.Float),sa.Column("net_pnl",sa.Float),sa.Column("execution_mode",sa.String(20)),sa.Column("entry_reason",sa.Text),sa.Column("exit_reason",sa.Text),sa.Column("timestamp",sa.DateTime(timezone=True),index=True))
+    op.create_table("audit_logs",sa.Column("id",sa.Integer,primary_key=True),sa.Column("event",sa.String(100),index=True),sa.Column("entity",sa.String(100)),sa.Column("entity_id",sa.String(100)),sa.Column("metadata_json",sa.JSON),sa.Column("timestamp",sa.DateTime(timezone=True)))
+    op.create_table("broker_connections",sa.Column("id",sa.Integer,primary_key=True),sa.Column("broker",sa.String(40),unique=True),sa.Column("status",sa.String(30)),sa.Column("access_token",sa.Text),sa.Column("updated_at",sa.DateTime(timezone=True)))
+def downgrade():
+    for t in ["broker_connections","audit_logs","trades","positions","orders","signals","strategies","users"]: op.drop_table(t)
